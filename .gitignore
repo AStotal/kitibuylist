@@ -1,0 +1,7 @@
+.DS_STORE
+venv
+.git
+.env
+.idea
+.handler-saves
+__pycache__
