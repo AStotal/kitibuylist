@@ -1,9 +1,8 @@
 # filters
 import logging
-from datetime import datetime
+from pprint import pformat, pprint
 from typing import Dict
 
-from pydantic import BaseModel, Field
 # telebot
 from telebot import TeleBot, types
 from telebot.types import Message
@@ -16,13 +15,15 @@ from tgbot.handlers.admin import admin_user
 from tgbot.handlers.spam_command import anti_spam
 from tgbot.handlers.user import any_user
 # utils
-from tgbot.utils.database import Database
+from tgbot.models.buy_models import BuyItem, BuyList
 
 # middlewares
 # states
+from tgbot.utils.nosqldb import Database
 
 logger = logging.getLogger("logger")
-db = Database()
+db = Database("db.json")
+# db.full_initialize()
 
 # remove this if you won't use middlewares:
 from telebot import apihelper
@@ -32,105 +33,86 @@ apihelper.ENABLE_MIDDLEWARE = True
 bot = TeleBot(config.TOKEN, num_threads=5)
 
 
-class BuyItem(BaseModel):
-    name: str
-    is_taken: bool = False
-
-    @property
-    def status(self):
-        return "✅" if self.is_taken else ""
-
-    def switch(self):
-        self.is_taken = not self.is_taken
-
-
-class BuyList(BaseModel):
-    name: str
-    archived: bool = False
-    editing: bool = True
-    created: datetime = Field(default_factory=datetime.now)
-    items: Dict[str, BuyItem] = Field(default_factory=dict)
-
-    def get_item(self, name: str):
-        return self.items.get(name)
-
-    def delete(self, item):
-        self.items.pop(item)
-
-    def add_item(self, item):
-        self.items[item.name] = item
-
-
-bl = BuyList(name="ololo", editing=False)
-bl.add_item(BuyItem(name="Cabbage"))
-bl.add_item(BuyItem(name="Potato"))
-bl.add_item(BuyItem(name="Flugengekhaimen"))
-
-buy_lists: Dict[str, BuyList] = {"ololo": bl}
-
-
 def dump_data(message, bot):
-    bot.send_message(message.chat.id, str(buy_lists))
+    formatted = pformat([i.dict() for i in db.lists().values()])
+    bot.send_message(message.chat.id, f"```\n{formatted}\n```", parse_mode="markdown")
 
 
-def handle_list_items(message: Message, active_buy_list, prev_msg=None):
-    # if not active_buy_list.editing:
-    #     return
+def handle_list_items(message: Message, list_id, prev_msg=None):
     for name in message.text.splitlines():
-        item = BuyItem(name=name)
-        active_buy_list.items[name] = item
+        db.create_item(name, list_id)
 
-    markup = get_list_markup(active_buy_list.name)
+    markup = get_list_markup(list_id)
     bot.delete_message(message.chat.id, message.message_id)
     if prev_msg:
         prev_msg = bot.edit_message_text("Added items:", prev_msg.chat.id, prev_msg.message_id, reply_markup=markup)
     else:
         prev_msg = bot.send_message(message.chat.id, "Added items:", reply_markup=markup)
-    bot.register_next_step_handler(message, handle_list_items, active_buy_list, prev_msg)
+    bot.register_next_step_handler(message, handle_list_items, list_id, prev_msg)
 
 
 def handle_new_list(message: Message, bot: TeleBot):
     chat_id = message.chat.id
     params = message.text.split(" ")
-    list_name = f"New list {len(buy_lists) + 1}"
+    list_name = None
     if len(params) != 1:
         list_name = " ".join(params[1:])
-    current_list = buy_lists.get(list_name, None)
-    if current_list is not None:
-        bot.send_message(chat_id, "List with such name already exists!")
-        return
-    current_list = BuyList(name=list_name)
-    buy_lists[list_name] = current_list
-    msg = bot.send_message(chat_id, f"Created new buy list with name: *{list_name}*\nEnter new items below:",
+    list_id = db.create_list(list_name)
+    db.items_editing = True
+    msg = bot.send_message(chat_id, f"Created new buy list{f' with name: *{list_name}*' if list_name else '.'}\n"
+                                    f"Enter new items below:",
                            parse_mode="Markdown")
-    bot.register_next_step_handler(msg, handle_list_items, current_list)
+    bot.register_next_step_handler(msg, handle_list_items, list_id)
 
 
-def get_list_markup(list_name):
-    active_list = buy_lists.get(list_name)
+def get_list_markup(list_id):
+    active_list = db.list(list_id)
     markup = types.InlineKeyboardMarkup()
 
     for item_name, _item in active_list.items.items():
         cb_fmt = "item_{}_{}_{}"
         action = "switch" if not active_list.archived else "switch-blocked"
-        item_cb = cb_fmt.format(action, list_name, item_name)
+        item_cb = cb_fmt.format(action, list_id, item_name)
         line = [types.InlineKeyboardButton(f"{_item.status} {item_name}", callback_data=item_cb)]
-        if active_list.editing:
-            line.append(types.InlineKeyboardButton("❌", callback_data=cb_fmt.format("delete", list_name, item_name)))
+        if db.items_editing:
+            line.append(types.InlineKeyboardButton("❌", callback_data=cb_fmt.format("delete", list_id, item_name)))
         markup.row(*line)
-
-    if active_list.editing:
+    back_button = types.InlineKeyboardButton("🔙 Back", callback_data=f"lists_show-lists")
+    if db.items_editing:
         markup.row(
-            types.InlineKeyboardButton("✅ Finish editing", callback_data=f"list_finish-edit_{active_list.name}")
+            types.InlineKeyboardButton("✅ Finish editing", callback_data=f"list_finish-edit_{list_id}")
         )
     elif active_list.archived:
         markup.row(
-            types.InlineKeyboardButton("🔒 List closed. Open?", callback_data=f"list_open_{active_list.name}")
+            types.InlineKeyboardButton("🔒 List closed. Open?", callback_data=f"list_open_{list_id}"),
+            back_button,
         )
     else:
         markup.row(
-            types.InlineKeyboardButton("👆 Edit list", callback_data=f"list_edit_{active_list.name}"),
-            types.InlineKeyboardButton("💳 Close list", callback_data=f"list_close_{active_list.name}")
+            types.InlineKeyboardButton("👆 Edit list", callback_data=f"list_edit_{list_id}"),
+            types.InlineKeyboardButton("💳 Close list", callback_data=f"list_close_{list_id}"),
+            back_button,
+        )
+
+    return markup
+
+
+def get_lists_markup(lists):
+    markup = types.InlineKeyboardMarkup()
+    for list_id, buy_list in lists.items():
+        line = [types.InlineKeyboardButton(f"{buy_list.status} {buy_list.name}", callback_data=f"lists_show_{list_id}")]
+        if db.lists_editing:
+            line.append(types.InlineKeyboardButton("❌", callback_data=f"lists_delete_{list_id}"))
+        markup.row(*line)
+
+    if db.lists_editing:
+        markup.row(
+            types.InlineKeyboardButton("✅ Finish editing", callback_data=f"lists_finish-edit")
+        )
+    else:
+        markup.row(
+            types.InlineKeyboardButton("👆 Edit lists", callback_data="lists_edit"),
+            types.InlineKeyboardButton("📤 Share list", callback_data=f"lists_share"),
         )
 
     return markup
@@ -140,16 +122,16 @@ def get_list_markup(list_name):
 def handle_query_item(call):
     cb_data = call.data.split("_")
     action = cb_data[1]
-    list_name = cb_data[2]
+    list_id = int(cb_data[2])
     item_name = cb_data[3]
-    buy_list = buy_lists.get(list_name)
+    buy_list = db.list(list_id)
     if action == "switch":
-        buy_list.items.get(item_name).switch()
+        db.switch_item(item_name, list_id)
     elif action == "switch-blocked":
         bot.answer_callback_query(call.id, "Cant switch item. List is closed")
         return
     elif action == "delete":
-        buy_list.delete(item_name)
+        db.delete_item(item_name, list_id)
     else:
         bot.answer_callback_query(callback_query_id=call.id,
                                   # show_alert=True,
@@ -158,7 +140,7 @@ def handle_query_item(call):
     bot.edit_message_text(chat_id=call.message.chat.id,
                           text=f"Buy list *{buy_list.name}*",
                           message_id=call.message.message_id,
-                          reply_markup=get_list_markup(buy_list.name),
+                          reply_markup=get_list_markup(list_id),
                           parse_mode="Markdown")
 
 
@@ -166,18 +148,18 @@ def handle_query_item(call):
 def handle_query_list(call):
     cb_data = call.data.split("_")
     action = cb_data[1]
-    list_name = cb_data[2]
-    buy_list = buy_lists.get(list_name)
+    list_id = int(cb_data[2])
+    buy_list = db.list(list_id)
     if action == "finish-edit":
-        buy_list.editing = False
+        db.items_editing = False
         bot.clear_step_handler(call.message)
     elif action == "edit":
-        buy_list.editing = True
-        bot.register_next_step_handler(call.message, handle_list_items, buy_list, call.message)
+        db.items_editing = True
+        bot.register_next_step_handler(call.message, handle_list_items, list_id, call.message)
     elif action == "close":
-        buy_list.archived = True
+        db.archive_list(list_id)
     elif action == "open":
-        buy_list.archived = False
+        db.unarchive_list(list_id)
     else:
         bot.answer_callback_query(callback_query_id=call.id,
                                   show_alert=True,
@@ -186,16 +168,75 @@ def handle_query_list(call):
     bot.edit_message_text(chat_id=call.message.chat.id,
                           text=f"Buy list *{buy_list.name}*",
                           message_id=call.message.message_id,
-                          reply_markup=get_list_markup(buy_list.name),
+                          reply_markup=get_list_markup(list_id),
+                          parse_mode="Markdown")
+
+
+@bot.callback_query_handler(lambda call: call.data.startswith("lists_"))
+def handle_query_lists(call):
+    cb_data = call.data.split("_")
+    action = cb_data[1]
+    if action == "finish-edit":
+        db.lists_editing = False
+    elif action == "edit":
+        db.lists_editing = True
+    elif action == "show":
+        list_id = int(cb_data[2])
+        buy_list = db.list(list_id)
+        bot.edit_message_text(chat_id=call.message.chat.id,
+                              text=f"Buy list *{buy_list.name}*",
+                              message_id=call.message.message_id,
+                              reply_markup=get_list_markup(list_id),
+                              parse_mode="Markdown")
+        return
+    elif action == "show-lists":
+        pass
+    elif action == "delete":
+        list_id = int(cb_data[2])
+        db.delete_list(list_id)
+    else:
+        bot.answer_callback_query(callback_query_id=call.id,
+                                  show_alert=True,
+                                  text=f"Unknown action: {action}")
+        return
+    bot.edit_message_text(chat_id=call.message.chat.id,
+                          text=f"Available lists:",
+                          message_id=call.message.message_id,
+                          reply_markup=get_lists_markup(db.lists()),
                           parse_mode="Markdown")
 
 
 def handle_print_list(message, bot):
-    for list_name, pl in buy_lists.items():
-        markup = get_list_markup(list_name)
-        bot.send_message(message.chat.id, f"List *{list_name}*",
-                         parse_mode="Markdown",
-                         reply_markup=markup)
+    buy_lists = db.lists()
+    markup = get_lists_markup(buy_lists)
+    bot.send_message(message.chat.id, f"Available lists:",
+                     parse_mode="Markdown",
+                     reply_markup=markup)
+
+
+suggestions = {
+    "commands": [
+        {
+            "command": "start",
+            "description": "Start using bot"
+        },
+        {
+            "command": "nl",
+            "description": "Create new list. Add specific name after command if you want"
+        },
+        {
+            "command": "pl",
+            "description": "Print all lists"
+        },
+        {
+            "command": "dump",
+            "description": "Dumps all lists in DB"
+        }
+    ],
+    # "language_code": "en",
+    "language_code": "ru",
+    "scope": {"type": "all_private_chats"}
+}
 
 
 def register_handlers():
@@ -213,7 +254,13 @@ register_handlers()
 # bot.register_middleware_handler(antispam_func, update_types=['message'])
 
 # custom filters
-bot.add_custom_filter(AdminFilter())
+# bot.add_custom_filter(AdminFilter())
+bot.set_my_commands(commands=[types.BotCommand("pl", "Print available lists"),
+                              types.BotCommand("nl", "Create new list"),
+                              types.BotCommand("dump", "Dump database"),
+                              ],
+                    scope=types.BotCommandScopeAllPrivateChats(),
+                    language_code="en")
 
 
 def run():
