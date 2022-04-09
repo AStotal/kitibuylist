@@ -6,3 +6,5 @@ load_dotenv(find_dotenv(usecwd=True))
 env = Env()
 
 TOKEN = env.str("TOKEN")
+APPNAME = env.str("APPNAME")
+

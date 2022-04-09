@@ -21,6 +21,7 @@ from tgbot.models.buy_models import BuyItem, BuyList
 # states
 from tgbot.utils.nosqldb import Database
 
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger("logger")
 db = Database("db.json")
 # db.full_initialize()
@@ -264,6 +265,9 @@ bot.set_my_commands(commands=[types.BotCommand("pl", "Print available lists"),
 
 
 def run():
+    bot.set_webhook(f'https://{config.APPNAME}.herokuapp.com/{config.TOKEN}')
+    logger.debug(bot.get_webhook_info())
+
     bot.infinity_polling()
 
 
